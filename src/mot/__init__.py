@@ -69,7 +69,7 @@ class MotObject:
     
     def __init__(self, name, body=None, type=ContentType.GENERAL_OBJECT_TRANSFER, transport_id=None):
         self._parameters = {}
-        if isinstance(name, basestring): self.add_parameter(ContentName(name))
+        if isinstance(name, str): self.add_parameter(ContentName(name))
         else: self.add_parameter(name)
         self._body = body
         self._type = type
@@ -81,7 +81,7 @@ class MotObject:
         self._parameters[param.__class__.__name__] = param
         
     def get_parameters(self):
-        return self._parameters.values()
+        return list(self._parameters.values())
     
     def get_parameter(self, clazz):
         return self._parameters.get(clazz.__name__)
@@ -283,7 +283,7 @@ class HeaderParameter:
         if data_length != data.length()/8: raise ValueError('data length %d is different from signalled data length %d' % (len(data), data_length))
         
         # check we know how to decode this
-        if not HeaderParameter.decoders.has_key(param_id):
+        if param_id not in HeaderParameter.decoders:
             raise UnknownHeaderParameter(param_id, bits[i : i + (data_start * 8) + (data_length * 8)])
         decoder = HeaderParameter.decoders[param_id]
         try:
@@ -571,7 +571,7 @@ def is_complete(t, cache):
             logger.debug('found %d datagroups for transport id %d type %d', len(datagroups), transport_id, type)
         else:
             datagroups = []
-            for k in cache.keys():
+            for k in list(cache.keys()):
                 if cache[k][0].get_type() == type: 
                     datagroups = cache[k]
                     break 
@@ -694,7 +694,7 @@ def compile_object(transport_id, cache):
         logger.debug('compiling header from directory object')
         if not cache.directory:
             directory = ''            
-            for k in cache.keys():
+            for k in list(cache.keys()):
                 if cache[k][0].get_type() == 6: 
                     for datagroup in cache[k]:
                         directory += datagroup.get_data()
@@ -754,7 +754,7 @@ def decode_objects(data, error_callback=None):
             cache[d.get_transport_id()] = items
 
             # examine cache for complete objects
-            for t in cache.keys():
+            for t in list(cache.keys()):
                 if is_complete(t, cache):
                     logger.debug('object with transport id %d is complete', t)
                     object = compile_object(t, cache)
