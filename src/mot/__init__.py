@@ -680,7 +680,7 @@ def compile_object(transport_id, cache):
                     param, size = HeaderParameter.from_bits(bits, i)
                     logger.debug('parsed header parameter: %s of size %d', param, size)
                     params.append(param)
-                except UnknownHeaderParameter, e:
+                except (UnknownHeaderParameter, e):
                     logger.warning('unknown header parameter (0x%02x) at position %d', e.id, (i/8))
                     if not e.data.length(): raise ValueError('unknown header parameter with no size - cannot continue')
                     size = e.data.length() / 8
