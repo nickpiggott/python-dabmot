@@ -316,7 +316,7 @@ class ContentName(HeaderParameter):
         bits += int_to_bitarray(self.charset, 4) # (0-3): Character set indicator
         bits += int_to_bitarray(0, 4) # (4-7): RFA
         tmp = bitarray()
-        tmp.fromstring(self.name)
+        tmp.frombytes(self.name.encode())
         bits += tmp
         return bits
     
@@ -341,7 +341,7 @@ class MimeType(HeaderParameter):
         
     def encode_data(self):
         bits = bitarray()
-        bits.fromstring(self.mimetype)
+        bits.frombytes(self.mimetype.encode())
         return bits
     
     @staticmethod
@@ -492,7 +492,7 @@ class DefaultPermitOutdatedVersions(DirectoryParameter):
         
     def encode_data(self):
         bits = bitarray()
-        bits.frombytes("\x01" if self.permit else "\x00")
+        bits.frombytes(b'\x01' if self.permit else b'\x00')
         return bits
 
 class DefaultRelativeExpiration(DirectoryParameter):

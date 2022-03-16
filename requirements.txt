@@ -1,0 +1,5 @@
+bitarray
+unittest2
+python-dabmsc
+crcmod
+python-dateutil
