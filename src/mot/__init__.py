@@ -1,9 +1,13 @@
 from bitarray import bitarray
-from msc import int_to_bitarray, bitarray_to_hex, generate_transport_id
+from bitarray.util import int2ba
+from msc import generate_transport_id
 from datetime import timedelta, datetime, time
 from dateutil.tz import tzutc
+from typing import List
 import logging
 import types
+import julian
+from enum import Enum
 
 logger = logging.getLogger('mot')
 
@@ -65,154 +69,6 @@ ContentType.MOT_HEADER_UPDATE = ContentType(5, 0)
 ContentType.SYSTEM_MHEG = ContentType(6, 0)
 ContentType.SYSTEM_JAVA = ContentType(6, 1)
     
-class MotObject:
-    
-    def __init__(self, name, body=None, type=ContentType.GENERAL_OBJECT_TRANSFER, transport_id=None):
-        self._parameters = {}
-        if isinstance(name, str): self.add_parameter(ContentName(name))
-        else: self.add_parameter(name)
-        self._body = body
-        self._type = type
-        self._transport_id = transport_id if transport_id is not None else generate_transport_id(name)
-        
-    def add_parameter(self, param):
-        if not isinstance(param, HeaderParameter): 
-            raise ValueError('parameter {param} of type {type} is not a valid header parameter'.format(param=param, type=param.__class__.__name__))
-        self._parameters[param.__class__.__name__] = param
-        
-    def get_parameters(self):
-        return list(self._parameters.values())
-    
-    def get_parameter(self, clazz):
-        return self._parameters.get(clazz.__name__)
-    
-    def has_parameter(self, clazz):
-        return self.get_parameter(clazz) is not None
-
-    def remove_parameter(self, clazz):
-        self._parameters.pop(clazz.__name__)
-    
-    def get_transport_id(self):
-        return self._transport_id
-    
-    def get_name(self):
-        return self.get_parameter(ContentName).name
-
-    def set_body(self, body):
-        self._body = body
-    
-    def get_body(self):
-        return self._body
-    
-    def get_type(self):
-        return self._type
-
-    def __str__(self):
-        return "{name} [{id}]".format(name=self.get_name(), id=self.get_transport_id())
-    
-def encode_absolute_time(timepoint):
-    
-    if timepoint is None: # NOW
-        bits = bitarray(32)
-        bits.setall(False)
-        return bits
-        
-    bits = bitarray()
-    
-    # adjust for non-UTC times
-    if timepoint.tzinfo is not None and timepoint.tzinfo != tzutc():
-        timepoint = timepoint.astimezone(tzutc())
-    
-    # b0: ValidityFlag: 1 for MJD and UTC are valid
-    bits += bitarray('1');
-    
-    # b1-17: MJD
-    a = (14 - timepoint.month) / 12;
-    y = timepoint.year + 4800 - a;
-    m = timepoint.month + (12 * a) - 3;
-    jdn = timepoint.day + ((153 * m) + 2) / 5 + (365 * y) + (y / 4) - (y / 100) + (y / 400) - 32045;
-    jd = jdn + (timepoint.hour - 12) / 24 + timepoint.minute / 1440 + timepoint.second / 86400;
-    mjd = (int)(jd - 2400000.5);
-    bits += int_to_bitarray(mjd, 17)
-    
-    # b18-19: RFU
-    bits += int_to_bitarray(0, 2)
-
-    # b20: UTC Flag
-    # b21: UTC - 11 or 27 bits depending on the form
-    if timepoint.second > 0:
-        bits += bitarray('1')
-        bits += int_to_bitarray(timepoint.hour, 5)
-        bits += int_to_bitarray(timepoint.minute, 6)
-        bits += int_to_bitarray(timepoint.second, 6)
-        bits += int_to_bitarray(timepoint.microsecond/1000, 10)
-    else:
-        bits += bitarray('0')
-        bits += int_to_bitarray(timepoint.hour, 5)
-        bits += int_to_bitarray(timepoint.minute, 6)
-
-    return bits
-
-def mjd_to_date(mjd):
-    return datetime.fromtimestamp((mjd - 40587) * 86400)
-
-def decode_absolute_time(bits):
-    
-    if not bits.any(): return None # NOW
-    
-    mjd = int(bits[1:18].to01(), 2)
-    date = mjd_to_date(mjd)
-    timepoint = datetime.combine(date, time())
-
-    if bits[20]:
-        timepoint.replace(hour=int(bits[21:26].to01(), 2))
-        timepoint.replace(minute=int(bits[26:32].to01(), 2))
-        timepoint.replace(second=int(bits[32:38].to01(), 2))
-        timepoint.replace(microsecond=int(bits[38:48].to01(), 2) * 1000)
-    else:
-        timepoint.replace(hour=int(bits[21:26].to01(), 2))
-        timepoint.replace(minute=int(bits[26:32].to01(), 2))    
-    return timepoint
-    
-def encode_relative_time(offset):
-    
-    bits = bitarray()
-    if offset < timedelta(minutes=127):
-        minutes = offset.seconds / 60
-        two_minutes = minutes / 2 # round to multiples of 2 minutes
-        bits += int_to_bitarray(0, 2) # (0-1): Granularity=0
-        bits += int_to_bitarray(two_minutes, 6) # (2-7): Interval
-    elif offset < timedelta(minutes=1891):
-        minutes = offset.seconds / 60
-        halfhours = minutes / 30 # round to multiples of 30 minutes
-        bits += int_to_bitarray(1, 2) # (0-1): Granularity=1
-        bits += int_to_bitarray(halfhours, 6) # (2-7): Interval
-    elif offset < timedelta(hours=127):
-        hours = offset.seconds / (60 * 60) + offset.days * 24
-        twohours = hours / 2
-        bits += int_to_bitarray(2, 2) # (0-1): Granularity=2
-        bits += int_to_bitarray(twohours, 6) # (2-7): Interval
-    elif offset < timedelta(hours=64*24):
-        days = offset.days
-        bits += int_to_bitarray(2, 3) # (0-1): Granularity=3
-        bits += int_to_bitarray(6, days) # (2-7): Interval
-    else:
-        raise ValueError('relative expiration is greater than the maximum allowed: %s > 63 days' % offset)
-    
-    return bits
-
-def decode_relative_time(bits):
-    raise ValueError('decoding of relative time parameter not done yet')
-
-class UnknownHeaderParameter:
-
-    def __init__(self, id, data):
-        self.id = id
-        self.data = data
-
-    def __str__(self):
-        return 'Unknown header parameter 0x%02x with size %d bytes' % (self.id, self.data.length()/8)
-
 class HeaderParameter:
     
     decoders = {}
@@ -230,25 +86,25 @@ class HeaderParameter:
         
         # create the correct parameter preamble
         if data_length == 0:
-            bits += int_to_bitarray(0, 2) # (0-1): PLI=0
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(0, 2) # (0-1): PLI=0
+            bits += int2ba(self.id, 6) # (2-7): ParamId
         elif data_length == 1:
-            bits += int_to_bitarray(1, 2) # (0-1): PLI=1
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(1, 2) # (0-1): PLI=1
+            bits += int2ba(self.id, 6) # (2-7): ParamId
         elif data_length == 4:
-            bits += int_to_bitarray(2, 2) # (0-1): PLI=2
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId\
+            bits += int2ba(2, 2) # (0-1): PLI=2
+            bits += int2ba(self.id, 6) # (2-7): ParamId\
             if data_length < 4: data += bitarray((4 - data_length) * 8)
         elif data_length <= 127:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.id, 6) # (2-7): ParamId
             bits += bitarray('0') # (8): Ext=0
-            bits += int_to_bitarray(data_length, 7) # (9-15): DataFieldLength in bytes     
+            bits += int2ba(data_length, 7) # (9-15): DataFieldLength in bytes     
         elif data_length <= 32770:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.id, 6) # (2-7): ParamId
             bits += bitarray('1') # (8): Ext=1
-            bits += int_to_bitarray(data_length, 15) # (9-23): DataFieldLength in bytes 
+            bits += int2ba(data_length, 15) # (9-23): DataFieldLength in bytes 
         
         bits += data
         
@@ -294,27 +150,171 @@ class HeaderParameter:
                          bitarray_to_hex(bits[i:i+(data_start*8)]), bitarray_to_hex(data), decoder)
             raise
         
-        return param, data_start + data_length         
+        return param, data_start + data_length     
 
-class ContentName(HeaderParameter):
-    '''Content Name'''
+class MotObject:
     
+    def __init__(self, name, body : bytes=None, contenttype : ContentType=ContentType.GENERAL_OBJECT_TRANSFER, transport_id : int=None):
+        self._parameters = {}
+        if isinstance(name, str): self.add_parameter(ContentName(name))
+        else: self.add_parameter(name)
+        if not type(body) == bytes: raise ValueError("Body must be a byte array not %s" % type(body))
+        self._body = body
+        self._contenttype = contenttype
+        self._transport_id = transport_id if transport_id is not None else generate_transport_id(name)
+        
+    def add_parameter(self, param) -> None:
+        if not isinstance(param, HeaderParameter): 
+            raise ValueError('parameter {param} of type {type} is not a valid header parameter'.format(param=param, type=param.__class__.__name__))
+        self._parameters[param.__class__.__name__] = param
+        
+    def get_parameters(self) -> List[HeaderParameter]:
+        return list(self._parameters.values())
+    
+    def get_parameter(self, clazz) -> HeaderParameter:
+        return self._parameters.get(clazz.__name__)
+    
+    def has_parameter(self, clazz) -> bool:
+        return self.get_parameter(clazz) is not None
+
+    def remove_parameter(self, clazz) -> None:
+        self._parameters.pop(clazz.__name__)
+    
+    def get_transport_id(self) -> int:
+        return self._transport_id
+    
+    def get_name(self) -> str:
+        return self.get_parameter(ContentName).name
+
+    def set_body(self, body : bytes) -> None:
+        if not type(body) == bytes: raise ValueError("Body must be a byte array")
+        self._body = body
+    
+    def get_body(self) -> bytes:
+        return self._body
+    
+    def get_contenttype(self) -> ContentType:
+        return self._contenttype
+
+    def __str__(self):
+        return "{name} [{id}]".format(name=self.get_name(), id=self.get_transport_id())
+    
+def encode_absolute_time(timepoint):
+  
+    if timepoint is None: # NOW
+        bits = bitarray(32)
+        bits.setall(False)
+        return bits
+        
+    bits = bitarray()
+    
+    # adjust for non-UTC times
+    if timepoint.tzinfo is not None and timepoint.tzinfo != tzutc():
+        timepoint = timepoint.astimezone(tzutc())
+    
+    # b0: ValidityFlag: 1 for MJD and UTC are valid
+    bits += bitarray('1');
+    
+    # b1-17: MJD
+    mjd = julian.to_jd(timepoint, fmt='mjd')
+    bits += int2ba(mjd, 17)
+    
+    # b18-19: RFU
+    bits += int2ba(0, 2)
+
+    # b20: UTC Flag
+    # b21: UTC - 11 or 27 bits depending on the form
+    if timepoint.second > 0:
+        bits += bitarray('1')
+        bits += int2ba(timepoint.hour, 5)
+        bits += int2ba(timepoint.minute, 6)
+        bits += int2ba(timepoint.second, 6)
+        bits += int2ba(timepoint.microsecond/1000, 10)
+    else:
+        bits += bitarray('0')
+        bits += int2ba(timepoint.hour, 5)
+        bits += int2ba(timepoint.minute, 6)
+
+    return bits
+
+def decode_absolute_time(bits):
+    
+    if not bits.any(): return None # NOW
+    
+    mjd = int(bits[1:18].to01(), 2)
+    date = julian.from_jd(mjd, fmt='mjd')
+    timepoint = datetime.combine(date, time())
+
+    if bits[20]:
+        timepoint.replace(hour=int(bits[21:26].to01(), 2))
+        timepoint.replace(minute=int(bits[26:32].to01(), 2))
+        timepoint.replace(second=int(bits[32:38].to01(), 2))
+        timepoint.replace(microsecond=int(bits[38:48].to01(), 2) * 1000)
+    else:
+        timepoint.replace(hour=int(bits[21:26].to01(), 2))
+        timepoint.replace(minute=int(bits[26:32].to01(), 2))    
+    return timepoint
+    
+def encode_relative_time(offset):
+    
+    bits = bitarray()
+    if offset < timedelta(minutes=127):
+        minutes = offset.seconds / 60
+        two_minutes = minutes / 2 # round to multiples of 2 minutes
+        bits += int2ba(0, 2) # (0-1): Granularity=0
+        bits += int2ba(two_minutes, 6) # (2-7): Interval
+    elif offset < timedelta(minutes=1891):
+        minutes = offset.seconds / 60
+        halfhours = minutes / 30 # round to multiples of 30 minutes
+        bits += int2ba(1, 2) # (0-1): Granularity=1
+        bits += int2ba(halfhours, 6) # (2-7): Interval
+    elif offset < timedelta(hours=127):
+        hours = offset.seconds / (60 * 60) + offset.days * 24
+        twohours = hours / 2
+        bits += int2ba(2, 2) # (0-1): Granularity=2
+        bits += int2ba(twohours, 6) # (2-7): Interval
+    elif offset < timedelta(hours=64*24):
+        days = offset.days
+        bits += int2ba(2, 3) # (0-1): Granularity=3
+        bits += int2ba(6, days) # (2-7): Interval
+    else:
+        raise ValueError('relative expiration is greater than the maximum allowed: %s > 63 days' % offset)
+    
+    return bits
+
+def decode_relative_time(bits):
+    raise ValueError('decoding of relative time parameter not done yet')
+
+class UnknownHeaderParameter:
+
+    def __init__(self, id, data):
+        self.id = id
+        self.data = data
+
+    def __str__(self):
+        return 'Unknown header parameter 0x%02x with size %d bytes' % (self.id, self.data.length()/8)    
+
+class CharacterSet(Enum):
+
     EBU_LATIN = 0
     EBU_LATIN_COMMON_CORE = 1
     EBU_LATIN_CORE = 2
     ISO_LATIN2 = 3
     ISO_LATIN1 = 4
     ISO_IEC_10646 = 15
-    
-    def __init__(self, name, charset=ISO_LATIN1):
+
+class ContentName(HeaderParameter):
+    '''Content Name'''
+
+    def __init__(self, name, charset=CharacterSet.ISO_LATIN1):
         HeaderParameter.__init__(self, 12)
         self.name = name
         self.charset = charset
         
     def encode_data(self):
         bits = bitarray()
-        bits += int_to_bitarray(self.charset, 4) # (0-3): Character set indicator
-        bits += int_to_bitarray(0, 4) # (4-7): RFA
+        bits += int2ba(self.charset.value, 4) # (0-3): Character set indicator
+        bits += int2ba(0, 4) # (4-7): RFA
         tmp = bitarray()
         tmp.frombytes(self.name.encode())
         bits += tmp
@@ -399,7 +399,7 @@ class Compression(HeaderParameter):
         self.type = type
         
     def encode_data(self):
-        return int_to_bitarray(self.type, 8)
+        return int2ba(self.type, 8)
     
     def __eq__(self, that):
         if not isinstance(that, Compression): return False
@@ -426,7 +426,7 @@ class Priority(HeaderParameter):
         self.priority = priority
         
     def encode_data(self):
-        return int_to_bitarray(self.priority, 8)
+        return int2ba(self.priority, 8)
     
     @staticmethod
     def decode_data(data):
@@ -447,24 +447,24 @@ class DirectoryParameter:
         
         # create the correct parameter preamble
         if data_length == 0:
-            bits += int_to_bitarray(0, 2) # (0-1): PLI=0
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(0, 2) # (0-1): PLI=0
+            bits += int2ba(self.id, 6) # (2-7): ParamId
         elif data_length == 1:
-            bits += int_to_bitarray(1, 2) # (0-1): PLI=1
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(1, 2) # (0-1): PLI=1
+            bits += int2ba(self.id, 6) # (2-7): ParamId
         elif data_length <= 4:
-            bits += int_to_bitarray(2, 2) # (0-1): PLI=2
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(2, 2) # (0-1): PLI=2
+            bits += int2ba(self.id, 6) # (2-7): ParamId
         elif data_length <= 127:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.id, 6) # (2-7): ParamId
             bits += bitarray('0') # (8): Ext=0
-            bits += int_to_bitarray(data_length, 7) # (9-15): DataFieldLength in bytes     
+            bits += int2ba(data_length, 7) # (9-15): DataFieldLength in bytes     
         elif data_length <= 32770:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.id, 6) # (2-7): ParamId
             bits += bitarray('1') # (8): Ext=1
-            bits += int_to_bitarray(data_length, 15) # (9-23): DataFieldLength in bytes 
+            bits += int2ba(data_length, 15) # (9-23): DataFieldLength in bytes 
         
         bits += data
         
@@ -680,7 +680,7 @@ def compile_object(transport_id, cache):
                     param, size = HeaderParameter.from_bits(bits, i)
                     logger.debug('parsed header parameter: %s of size %d', param, size)
                     params.append(param)
-                except (UnknownHeaderParameter, e):
+                except UnknownHeaderParameter as e:
                     logger.warning('unknown header parameter (0x%02x) at position %d', e.id, (i/8))
                     if not e.data.length(): raise ValueError('unknown header parameter with no size - cannot continue')
                     size = e.data.length() / 8
