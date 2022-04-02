@@ -1,0 +1,3 @@
+*.pyc
+**/dabmot.egg-info
+.eggs/*
