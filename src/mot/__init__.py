@@ -1,9 +1,16 @@
+from email.header import Header
 from bitarray import bitarray
-from msc import int_to_bitarray, bitarray_to_hex, generate_transport_id
+from bitarray.util import ba2int, int2ba
+from msc import generate_transport_id
 from datetime import timedelta, datetime, time
 from dateutil.tz import tzutc
+from typing import List
+
 import logging
 import types
+import julian
+
+from enum import Enum
 
 logger = logging.getLogger('mot')
 
@@ -64,204 +71,63 @@ ContentType.MOT_HEADER_UPDATE = ContentType(5, 0)
 # System
 ContentType.SYSTEM_MHEG = ContentType(6, 0)
 ContentType.SYSTEM_JAVA = ContentType(6, 1)
-    
-class MotObject:
-    
-    def __init__(self, name, body=None, type=ContentType.GENERAL_OBJECT_TRANSFER, transport_id=None):
-        self._parameters = {}
-        if isinstance(name, str): self.add_parameter(ContentName(name))
-        else: self.add_parameter(name)
-        self._body = body
-        self._type = type
-        self._transport_id = transport_id if transport_id is not None else generate_transport_id(name)
-        
-    def add_parameter(self, param):
-        if not isinstance(param, HeaderParameter): 
-            raise ValueError('parameter {param} of type {type} is not a valid header parameter'.format(param=param, type=param.__class__.__name__))
-        self._parameters[param.__class__.__name__] = param
-        
-    def get_parameters(self):
-        return list(self._parameters.values())
-    
-    def get_parameter(self, clazz):
-        return self._parameters.get(clazz.__name__)
-    
-    def has_parameter(self, clazz):
-        return self.get_parameter(clazz) is not None
 
-    def remove_parameter(self, clazz):
-        self._parameters.pop(clazz.__name__)
-    
-    def get_transport_id(self):
-        return self._transport_id
-    
-    def get_name(self):
-        return self.get_parameter(ContentName).name
+__header_parameter_decoders = {}
 
-    def set_body(self, body):
-        self._body = body
+def register_header_parameter_decoder(i, f):
+    __header_parameter_decoders[i] = f
     
-    def get_body(self):
-        return self._body
-    
-    def get_type(self):
-        return self._type
-
-    def __str__(self):
-        return "{name} [{id}]".format(name=self.get_name(), id=self.get_transport_id())
-    
-def encode_absolute_time(timepoint):
-    
-    if timepoint is None: # NOW
-        bits = bitarray(32)
-        bits.setall(False)
-        return bits
-        
-    bits = bitarray()
-    
-    # adjust for non-UTC times
-    if timepoint.tzinfo is not None and timepoint.tzinfo != tzutc():
-        timepoint = timepoint.astimezone(tzutc())
-    
-    # b0: ValidityFlag: 1 for MJD and UTC are valid
-    bits += bitarray('1');
-    
-    # b1-17: MJD
-    a = (14 - timepoint.month) / 12;
-    y = timepoint.year + 4800 - a;
-    m = timepoint.month + (12 * a) - 3;
-    jdn = timepoint.day + ((153 * m) + 2) / 5 + (365 * y) + (y / 4) - (y / 100) + (y / 400) - 32045;
-    jd = jdn + (timepoint.hour - 12) / 24 + timepoint.minute / 1440 + timepoint.second / 86400;
-    mjd = (int)(jd - 2400000.5);
-    bits += int_to_bitarray(mjd, 17)
-    
-    # b18-19: RFU
-    bits += int_to_bitarray(0, 2)
-
-    # b20: UTC Flag
-    # b21: UTC - 11 or 27 bits depending on the form
-    if timepoint.second > 0:
-        bits += bitarray('1')
-        bits += int_to_bitarray(timepoint.hour, 5)
-        bits += int_to_bitarray(timepoint.minute, 6)
-        bits += int_to_bitarray(timepoint.second, 6)
-        bits += int_to_bitarray(timepoint.microsecond/1000, 10)
-    else:
-        bits += bitarray('0')
-        bits += int_to_bitarray(timepoint.hour, 5)
-        bits += int_to_bitarray(timepoint.minute, 6)
-
-    return bits
-
-def mjd_to_date(mjd):
-    return datetime.fromtimestamp((mjd - 40587) * 86400)
-
-def decode_absolute_time(bits):
-    
-    if not bits.any(): return None # NOW
-    
-    mjd = int(bits[1:18].to01(), 2)
-    date = mjd_to_date(mjd)
-    timepoint = datetime.combine(date, time())
-
-    if bits[20]:
-        timepoint.replace(hour=int(bits[21:26].to01(), 2))
-        timepoint.replace(minute=int(bits[26:32].to01(), 2))
-        timepoint.replace(second=int(bits[32:38].to01(), 2))
-        timepoint.replace(microsecond=int(bits[38:48].to01(), 2) * 1000)
-    else:
-        timepoint.replace(hour=int(bits[21:26].to01(), 2))
-        timepoint.replace(minute=int(bits[26:32].to01(), 2))    
-    return timepoint
-    
-def encode_relative_time(offset):
-    
-    bits = bitarray()
-    if offset < timedelta(minutes=127):
-        minutes = offset.seconds / 60
-        two_minutes = minutes / 2 # round to multiples of 2 minutes
-        bits += int_to_bitarray(0, 2) # (0-1): Granularity=0
-        bits += int_to_bitarray(two_minutes, 6) # (2-7): Interval
-    elif offset < timedelta(minutes=1891):
-        minutes = offset.seconds / 60
-        halfhours = minutes / 30 # round to multiples of 30 minutes
-        bits += int_to_bitarray(1, 2) # (0-1): Granularity=1
-        bits += int_to_bitarray(halfhours, 6) # (2-7): Interval
-    elif offset < timedelta(hours=127):
-        hours = offset.seconds / (60 * 60) + offset.days * 24
-        twohours = hours / 2
-        bits += int_to_bitarray(2, 2) # (0-1): Granularity=2
-        bits += int_to_bitarray(twohours, 6) # (2-7): Interval
-    elif offset < timedelta(hours=64*24):
-        days = offset.days
-        bits += int_to_bitarray(2, 3) # (0-1): Granularity=3
-        bits += int_to_bitarray(6, days) # (2-7): Interval
-    else:
-        raise ValueError('relative expiration is greater than the maximum allowed: %s > 63 days' % offset)
-    
-    return bits
-
-def decode_relative_time(bits):
-    raise ValueError('decoding of relative time parameter not done yet')
-
-class UnknownHeaderParameter:
-
-    def __init__(self, id, data):
-        self.id = id
-        self.data = data
-
-    def __str__(self):
-        return 'Unknown header parameter 0x%02x with size %d bytes' % (self.id, self.data.length()/8)
-
 class HeaderParameter:
     
-    decoders = {}
-    
+
     def __init__(self, id):
-        self.id = id
+        self.__id = id
     
-    def encode(self):
+    def tobytes(self) -> bytes:
+        """
+        Render the header preamble with the encoded data from the subclass
+        """
         
         # encode the data first
         data = self.encode_data()
-        data_length = len(data.tobytes())
-        
-        bits = bitarray()
+        data_length = len(data)
         
         # create the correct parameter preamble
+        bits = bitarray()
         if data_length == 0:
-            bits += int_to_bitarray(0, 2) # (0-1): PLI=0
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(0, 2) # (0-1): PLI=0
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
         elif data_length == 1:
-            bits += int_to_bitarray(1, 2) # (0-1): PLI=1
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(1, 2) # (0-1): PLI=1
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
         elif data_length == 4:
-            bits += int_to_bitarray(2, 2) # (0-1): PLI=2
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId\
+            bits += int2ba(2, 2) # (0-1): PLI=2
+            bits += int2ba(self.__id, 6) # (2-7): ParamId\
             if data_length < 4: data += bitarray((4 - data_length) * 8)
         elif data_length <= 127:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
             bits += bitarray('0') # (8): Ext=0
-            bits += int_to_bitarray(data_length, 7) # (9-15): DataFieldLength in bytes     
+            bits += int2ba(data_length, 7) # (9-15): DataFieldLength in bytes     
         elif data_length <= 32770:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
             bits += bitarray('1') # (8): Ext=1
-            bits += int_to_bitarray(data_length, 15) # (9-23): DataFieldLength in bytes 
+            bits += int2ba(data_length, 15) # (9-23): DataFieldLength in bytes 
         
-        bits += data
-        
-        return bits
+        return bits.tobytes() + data
     
-    def encode_data(self):
+    def encode_data(self) -> bytes:
         raise NotImplementedError()
     
     @staticmethod
-    def from_bits(bits, i=0):
-                
-        PLI = int(bits[i:i+2].to01(), 2)
-        param_id = int(bits[i+2:i+8].to01(), 2)
+    def frombytes(data):
+
+        bits = bitarray()
+        bits.frombytes(data)                  
+        
+        PLI = ba2int(bits[:2])
+        param_id = ba2int(bits[2:8])
         
         if PLI == 0:
             data_start = 1
@@ -273,76 +139,247 @@ class HeaderParameter:
             data_start = 1
             data_length = 4
         elif PLI == 3:
-            if bits[i+8]:
+            if bits[8]:
                 data_start = 3 
-                data_length = int(bits[i+9:i+24].to01(), 2)
+                data_length = ba2int(bits[9:24])
             else:
                 data_start = 2 
-                data_length = int(bits[i+9:i+16].to01(), 2)
-        data = bits[i + (data_start * 8) : i + (data_start * 8) + (data_length * 8)]
-        if data_length != data.length()/8: raise ValueError('data length %d is different from signalled data length %d' % (len(data), data_length))
+                data_length = ba2int(bits[9:16])
+
+        # check a good data length
+        if data_length != len(data - data_start) : raise ValueError('data length %d is different from signalled data length %d' % (len(data-data_start), data_length))
         
         # check we know how to decode this
         if param_id not in HeaderParameter.decoders:
-            raise UnknownHeaderParameter(param_id, bits[i : i + (data_start * 8) + (data_length * 8)])
+            raise UnknownHeaderParameter(param_id, data)
         decoder = HeaderParameter.decoders[param_id]
         try:
-            param = decoder(data)
+            param = decoder(data[data_start:])
             logger.debug('decoded parameter %s from param id %d with decoder %s', param, param_id, decoder)
         except:
             logger.error('error decoding parameter from content: header=%s | data=%s | using decoder: %s', 
-                         bitarray_to_hex(bits[i:i+(data_start*8)]), bitarray_to_hex(data), decoder)
-            raise
+                         data[:data_start].hex(), data[:data_start].hex(), decoder)
+            raise HeaderParameterError(param_id, data)
         
-        return param, data_start + data_length         
+        return param, data_start + data_length     
 
-class ContentName(HeaderParameter):
-    '''Content Name'''
+class MotObject:
     
+    def __init__(self, name, body : bytes=None, contenttype : ContentType=ContentType.GENERAL_OBJECT_TRANSFER, transport_id : int=None):
+        self.__parameters = {}
+        if isinstance(name, str): self.add_parameter(ContentName(name))
+        else: self.add_parameter(name)
+        if not type(body) == bytes: raise ValueError("Body must be a byte array not %s" % type(body))
+        self.__body = body
+        self.__contenttype = contenttype
+        self.__transport_id = transport_id if transport_id is not None else generate_transport_id(name)
+        
+    def add_parameter(self, param) -> None:
+        if not isinstance(param, HeaderParameter): 
+            raise ValueError('parameter {param} of type {type} is not a valid header parameter'.format(param=param, type=param.__class__.__name__))
+        self.__parameters[param.__class__.__name__] = param
+        
+    def get_parameters(self) -> List[HeaderParameter]:
+        return list(self.__parameters.values())
+    
+    def get_parameter(self, clazz) -> HeaderParameter:
+        return self.__parameters.get(clazz.__name__)
+    
+    def has_parameter(self, clazz) -> bool:
+        return self.get_parameter(clazz) is not None
+
+    def remove_parameter(self, clazz) -> None:
+        self.__parameters.pop(clazz.__name__)
+    
+    def get_transport_id(self) -> int:
+        return self.__transport_id
+    
+    def get_name(self) -> str:
+        return self.get_parameter(ContentName)
+
+    def set_body(self, body : bytes) -> None:
+        if not type(body) == bytes: raise ValueError("Body must be a byte array")
+        self.__body = body
+    
+    def get_body(self) -> bytes:
+        return self.__body
+    
+    def get_contenttype(self) -> ContentType:
+        return self.__contenttype
+
+    def __str__(self):
+        return "{name} [{id}]".format(name=self.get_name(), id=self.get_transport_id())
+    
+def encode_absolute_time(timepoint):
+  
+    if timepoint is None: # NOW
+        bits = bitarray(32)
+        bits.setall(False)
+        return bits.tobytes()
+        
+    bits = bitarray()
+    
+    # adjust for non-UTC times
+    if timepoint.tzinfo is not None and timepoint.tzinfo != tzutc():
+        timepoint = timepoint.astimezone(tzutc())
+    
+    # b0: ValidityFlag: 1 for MJD and UTC are valid
+    bits += bitarray('1');
+    
+    # b1-17: MJD
+    mjd = int(julian.to_jd(timepoint, fmt='mjd'))
+    bits += int2ba(mjd, 17)
+    
+    # b18-19: RFU
+    bits += int2ba(0, 2)
+
+    # b20: UTC Flag
+    # b21: UTC - 11 or 27 bits depending on the form
+    if timepoint.second > 0:
+        bits += bitarray('1')
+        bits += int2ba(int(timepoint.hour), 5)
+        bits += int2ba(int(timepoint.minute), 6)
+        bits += int2ba(int(timepoint.second), 6)
+        bits += int2ba(int(timepoint.microsecond/1000), 10)
+    else:
+        bits += bitarray('0')
+        bits += int2ba(int(timepoint.hour), 5)
+        bits += int2ba(int(timepoint.minute), 6)
+
+    return bits.tobytes()
+
+def decode_absolute_time(data: bytes) -> datetime:
+    """
+    Decode an absolute timepoint from a byte array
+    """
+    
+    bits = bitarray()
+    bits.frombytes(data)
+    if not bits.any(): return None # NOW
+    
+    mjd = int(bits[1:18].to01(), 2)
+    date = julian.from_jd(mjd, fmt='mjd')
+    timepoint = datetime.combine(date, time())
+
+    if bits[20]:
+        timepoint.replace(hour=ba2int(bits[21:26]))
+        timepoint.replace(minute=ba2int(bits[26:32]))
+        timepoint.replace(second=ba2int(bits[32:38]))
+        timepoint.replace(microsecond=ba2int(bits[38:48]) * 1000)
+    else:
+        timepoint.replace(hour=ba2int(bits[21:26]))
+        timepoint.replace(minute=ba2int(bits[26:32]))    
+    return timepoint
+    
+def encode_relative_time(offset):
+    
+    bits = bitarray()
+    if offset < timedelta(minutes=127):
+        minutes = int(offset.seconds / 60)
+        two_minutes = int(minutes / 2) # round to multiples of 2 minutes
+        bits += int2ba(0, 2) # (0-1): Granularity=0
+        bits += int2ba(two_minutes, 6) # (2-7): Interval
+    elif offset < timedelta(minutes=1891):
+        minutes = int(offset.seconds / 60)
+        halfhours = int(minutes / 30) # round to multiples of 30 minutes
+        bits += int2ba(1, 2) # (0-1): Granularity=1
+        bits += int2ba(halfhours, 6) # (2-7): Interval
+    elif offset < timedelta(hours=127):
+        hours = int(offset.seconds / (60 * 60) + offset.days * 24)
+        twohours = int(hours / 2)
+        bits += int2ba(2, 2) # (0-1): Granularity=2
+        bits += int2ba(twohours, 6) # (2-7): Interval
+    elif offset < timedelta(hours=64*24):
+        days = offset.days
+        bits += int2ba(2, 3) # (0-1): Granularity=3
+        bits += int2ba(6, days) # (2-7): Interval
+    else:
+        raise ValueError('relative expiration is greater than the maximum allowed: %s > 63 days' % offset)
+    
+    return bits.tobytes()
+
+def decode_relative_time(data: bytes) -> timedelta:
+    """
+    TODO Decode a relative time from a byte array
+    """
+    raise ValueError('decoding of relative time parameter not done yet')
+
+class HeaderParameterError:
+
+    def __init__(self, data):
+        self.__data = data  
+
+    def __str__(self):
+        return "Error with header parameter data %s" % self.__data.hex()  
+
+class UnknownHeaderParameter(HeaderParameterError):
+
+    def __init__(self, id, data):
+        HeaderParameterError.__init__(data)
+        self.__id = id
+
+    def __str__(self):
+        return 'Unknown header parameter 0x%02x with size %d bytes' % (self.__id, self.__data)    
+
+class CharacterSet(Enum):
+
     EBU_LATIN = 0
     EBU_LATIN_COMMON_CORE = 1
     EBU_LATIN_CORE = 2
     ISO_LATIN2 = 3
     ISO_LATIN1 = 4
     ISO_IEC_10646 = 15
-    
-    def __init__(self, name, charset=ISO_LATIN1):
+
+class ContentName(HeaderParameter):
+    """
+    6.2.2.1.1 ContentName
+    The parameter ContentName is used to uniquely identify an object. At any time only one object with a certain
+    ContentName shall be broadcast. 
+    """
+
+    def __init__(self, name, charset=CharacterSet.ISO_LATIN1):
         HeaderParameter.__init__(self, 12)
-        self.name = name
-        self.charset = charset
+        self.__name = name
+        self.__charset = charset
+
+    def get_name() -> str:
+        return self.__name
+
+    def get_charset() -> CharacterSet:
+        return self.__charset
         
-    def encode_data(self):
+    def encode_data(self) -> bytes:
         bits = bitarray()
-        bits += int_to_bitarray(self.charset, 4) # (0-3): Character set indicator
-        bits += int_to_bitarray(0, 4) # (4-7): RFA
-        tmp = bitarray()
-        tmp.frombytes(self.name.encode())
-        bits += tmp
-        return bits
+        bits += int2ba(self.__charset.value, 4) # (0-3): Character set indicator
+        bits += int2ba(0, 4) # (4-7): RFA
+        return bits.tobytes() + self.__name.encode()
     
     @staticmethod
-    def decode_data(data):
-        charset = int(data[0:4].to01(), 2)
-        return ContentName(data[8:].tostring(), charset) # TODO encode to the specific character set
+    def decode_data(data: bytes):
+        charset = CharacterSet(int((data[0] & 0b11110000) >> 4))
+        return ContentName(data[1:], charset) # TODO encode to the specific character set
     
     def __str__(self):
-        return self.name
+        return self.__name
         
     def __repr__(self):
         return "<ContentName: %s>" % str(self)
     
         
 class MimeType(HeaderParameter):
-    '''Content MIME type'''
-    
+    """
+    6.2.2.1.2 MimeType
+    In HTTP, the type of an object is indicated using the Multi-purpose Internet Mail Extensions (MIME) [4] mechanism.
+    MIME strings categorize object types according to first a general type followed by a specific format,
+    e.g. "text/html", "image/jpeg" and "application/octet-stream".
+    """
+
     def __init__(self, mimetype):
         HeaderParameter.__init__(self, 16)
-        self.mimetype = mimetype
+        self.__mimetype = mimetype
         
-    def encode_data(self):
-        bits = bitarray()
-        bits.frombytes(self.mimetype.encode())
-        return bits
+    def encode_data(self) -> bytes:
+        return self.__mimetype.encode()
     
     @staticmethod
     def decode_data(data):
@@ -350,45 +387,58 @@ class MimeType(HeaderParameter):
     
 class ExpirationParameter(HeaderParameter):
     
+    """
+    6.2.3.1.1 Expiration
+    The parameter Expiration indicates how long an object can still be used by the MOT decoder after reception loss.
+    The size of the DataField determines if an absolute or a relative expire time is specified
+    """
+
     @staticmethod
     def decode_data(data):
-        if len(data)/8 == 1:
+        if len(data) == 1:
             return RelativeExpiration(decode_relative_time(data))
-        elif len(data)/8 in [4, 6]:
+        elif len(data) in [4, 6]:
             return AbsoluteExpiration(decode_absolute_time(data))
         else:
             raise ValueError('unknown data length for expiration: %d bytes' % (len(data)/8))    
     
 class RelativeExpiration(ExpirationParameter):
-    '''Indicates the maximum time span an object is considered
-       valid after the last time the MOT decoder could verify 
-       that this object is still broadcast. 
+    """
+    6.2.3.1.1.2
+    Indicates the maximum time span an object is considered
+    valid after the last time the MOT decoder could verify 
+    that this object is still broadcast. 
  
-       The duration can be at various levels of temporal resolution
-       and covered intervals.
+    The duration can be at various levels of temporal resolution
+    and covered intervals.
  
-       two minutes - 2 minutes to 126 minutes
-       half hours - half an hour to 31.5 hours
-       two hours - 2 hours to 5 days 6 hours'''
+    two minutes - 2 minutes to 126 minutes
+    half hours - half an hour to 31.5 hours
+    two hours - 2 hours to 5 days 6 hours
+    """
     
     def __init__(self, offset):
         HeaderParameter.__init__(self, 4)
-        self.offset = offset
+        self.__offset = offset
         
-    def encode_data(self):
-        return encode_relative_time(self.offset)
+    def encode_data(self) -> bytes:
+        return encode_relative_time(self.__offset)
             
 class AbsoluteExpiration(ExpirationParameter):
-    '''The value, as coded in UTC specifies the absolute time when
-       the object expires. The object will not be valid anymore and 
-       therefore shall no longer be presented.'''
+    """
+    6.2.3.1.1.1
+    If the size of the data field is 4 bytes or 6 bytes, then an absolute expire time is defined. 
+    The value of the parameter field is coded in the UTC format (see clause 6.2.4.1). It specifies 
+    the (absolute) time in UTC when the object expires. The object is not valid anymore after it 
+    expired and therefore it shall no longer be presented. 
+    """
  
     def __init__(self, timepoint):
         HeaderParameter.__init__(self, 4)
-        self.timepoint = timepoint
+        self.__timepoint = timepoint
         
-    def encode_data(self):
-        return encode_absolute_time(self.timepoint)
+    def encode_data(self) -> bytes:
+        return encode_absolute_time(self.__timepoint)
            
 class Compression(HeaderParameter):
     '''Used to indicate that an object has been compressed and
@@ -396,82 +446,80 @@ class Compression(HeaderParameter):
           
     def __init__(self, type):
         HeaderParameter.__init__(self, 17)
-        self.type = type
+        self.__type = type
         
-    def encode_data(self):
-        return int_to_bitarray(self.type, 8)
+    def encode_data(self) -> bytes:
+        return self.__type.value.to_bytes(1, byteorder='big')
     
     def __eq__(self, that):
         if not isinstance(that, Compression): return False
-        return self.type == that.type
+        return self.__type == that.__type
     
     @staticmethod
     def decode_data(data):
-        return Compression(int(data.to01(), 2))
+        return Compression(CompressionType(int.from_bytes(data)))
     
-Compression_RESERVED = Compression(0)
-Compression.GZIP = Compression(1)    
+class CompressionType(Enum):
+    RESERVED = 0
+    GZIP = 1
         
 class Priority(HeaderParameter):
-    '''Indicates the storage priority, i.e. in case of a memory
-       state only the objects having a high priority should
-       be stored. It indicates the relevance of the content of the
-       particular object for the service.
-
-       The possible values range from 0 = highest to 255 = lowest'''
+    """
+    6.2.3.1.4 Priority
+    The parameter is used to indicate the storage priority, i.e. in case of a "memory full" state only the objects having a high
+    priority should be stored.
+    """
     
     def __init__(self, priority):
-        assert priority >=0 and priority <= 255
+        if priority < 1 or priority > 255: raise ValueError("priority must be between 0 and 255, inclusive")
         HeaderParameter.__init__(self, 10)
-        self.priority = priority
+        self.__priority = priority
         
-    def encode_data(self):
-        return int_to_bitarray(self.priority, 8)
+    def encode_data(self) -> bytes:
+        return self.__priority.to_bytes(1, byteorder='big')
     
     @staticmethod
     def decode_data(data):
-        return Priority(int(data.to01(), 2))
+        return Priority(int.from_bytes(data))
         
 class DirectoryParameter:
     
     def __init__(self, id):
-        self.id = id
+        self.__id = id
     
-    def encode(self):
+    def tobytes(self):
         
         # encode the data first
         data = self.encode_data()
-        data_length = len(data.tobytes())
+        data_length = len(data)
         
         bits = bitarray()
         
         # create the correct parameter preamble
         if data_length == 0:
-            bits += int_to_bitarray(0, 2) # (0-1): PLI=0
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(0, 2) # (0-1): PLI=0
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
         elif data_length == 1:
-            bits += int_to_bitarray(1, 2) # (0-1): PLI=1
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(1, 2) # (0-1): PLI=1
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
         elif data_length <= 4:
-            bits += int_to_bitarray(2, 2) # (0-1): PLI=2
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(2, 2) # (0-1): PLI=2
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
         elif data_length <= 127:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
             bits += bitarray('0') # (8): Ext=0
-            bits += int_to_bitarray(data_length, 7) # (9-15): DataFieldLength in bytes     
+            bits += int2ba(data_length, 7) # (9-15): DataFieldLength in bytes     
         elif data_length <= 32770:
-            bits += int_to_bitarray(3, 2) # (0-1): PLI=3
-            bits += int_to_bitarray(self.id, 6) # (2-7): ParamId
+            bits += int2ba(3, 2) # (0-1): PLI=3
+            bits += int2ba(self.__id, 6) # (2-7): ParamId
             bits += bitarray('1') # (8): Ext=1
-            bits += int_to_bitarray(data_length, 15) # (9-23): DataFieldLength in bytes 
-        
-        bits += data
-        
-        return bits
+            bits += int2ba(data_length, 15) # (9-23): DataFieldLength in bytes 
 
-    def encode_data(self):
-        return bitarray() 
+        return bits.tobytes() + data
+    
+    def encode_data(self) -> bytes:
+        raise NotImplementedError()
     
     
 class DefaultPermitOutdatedVersions(DirectoryParameter):
@@ -488,12 +536,10 @@ class DefaultPermitOutdatedVersions(DirectoryParameter):
     
     def __init__(self, permit):
         DirectoryParameter.__init__(self, 1)
-        self.permit = permit
+        self.__permit = permit
         
     def encode_data(self):
-        bits = bitarray()
-        bits.frombytes(b'\x01' if self.permit else b'\x00')
-        return bits
+        return b'\x01' if self.__permit else b'\x00'
 
 class DefaultRelativeExpiration(DirectoryParameter):
     '''Used to indicate a default value that specifies how
@@ -519,10 +565,10 @@ class DefaultRelativeExpiration(DirectoryParameter):
        
     def __init__(self, offset):
         DirectoryParameter.__init__(self, 9)
-        self.offset = offset
+        self.__offset = offset
         
     def encode_data(self):
-        return encode_relative_time(self.offset)
+        return encode_relative_time(self.__offset)
     
 class DefaultAbsoluteExpiration(DirectoryParameter):
     '''Used to indicate a default value that specifies how
@@ -541,10 +587,10 @@ class DefaultAbsoluteExpiration(DirectoryParameter):
        
     def __init__(self, timepoint):
         DirectoryParameter.__init__(self, 9)
-        self.timepoint = timepoint
+        self.__timepoint = timepoint
         
     def encode_data(self):
-        return encode_absolute_time(self.timepoint)
+        return encode_absolute_time(self.__timepoint)
     
 class SortedHeaderInformation(DirectoryParameter):
     '''Used to signal that the headers within the MOT directory
@@ -555,11 +601,11 @@ class SortedHeaderInformation(DirectoryParameter):
         DirectoryParameter.__init__(self, 0)
         
 # register the core parameter decoders
-HeaderParameter.decoders[12] = ContentName.decode_data
-HeaderParameter.decoders[16] = MimeType.decode_data
-HeaderParameter.decoders[4] = ExpirationParameter.decode_data
-HeaderParameter.decoders[17] = Compression.decode_data
-HeaderParameter.decoders[10] = Priority.decode_data          
+register_header_parameter_decoder(12, ContentName.decode_data)
+register_header_parameter_decoder(16, MimeType.decode_data)
+register_header_parameter_decoder(4, ExpirationParameter.decode_data)
+register_header_parameter_decoder(17, Compression.decode_data)
+register_header_parameter_decoder(10, Priority.decode_data)
         
 def is_complete(t, cache):
     
@@ -680,7 +726,7 @@ def compile_object(transport_id, cache):
                     param, size = HeaderParameter.from_bits(bits, i)
                     logger.debug('parsed header parameter: %s of size %d', param, size)
                     params.append(param)
-                except (UnknownHeaderParameter, e):
+                except UnknownHeaderParameter as e:
                     logger.warning('unknown header parameter (0x%02x) at position %d', e.id, (i/8))
                     if not e.data.length(): raise ValueError('unknown header parameter with no size - cannot continue')
                     size = e.data.length() / 8

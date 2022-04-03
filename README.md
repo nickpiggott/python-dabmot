@@ -7,6 +7,13 @@ This is designed to be used in conjunction with the `python-msc` library and pro
 
 # Dependencies
 
+* `bitarray`
+* `python-dabmsc`
+* `crcmod`
+* `python-dateutil`
+
+with `unittest2` for teseting
+
 # Utilities
 
 # Examples
@@ -16,7 +23,7 @@ Creating an MOT object and adding parameters
 ```python
 from mot import MotObject, ContentType
 
-# create MOT object
+# create MOT object with 1024 bytes of blank data
 object = MotObject("TestObject", "\x00" * 1024, ContentType.IMAGE_JFIF)
 
 # add additional parameter - mimetype and absolute expiration
