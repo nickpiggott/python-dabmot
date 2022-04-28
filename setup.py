@@ -11,6 +11,7 @@ setup(name='dabmot',
       packages=['mot'],
       package_dir = {'' : 'src'},
       keywords = ['dab', 'mot', 'radio'],
+      install_requires = ['jdcal'],
       test_requires = ['unittest2'],
       tests = ['test']
      )

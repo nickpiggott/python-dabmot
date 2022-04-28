@@ -2,6 +2,7 @@ from bitarray import bitarray
 from msc import int_to_bitarray, bitarray_to_hex, generate_transport_id
 from datetime import timedelta, datetime, time
 from dateutil.tz import tzutc
+from jdcal import gcal2jd
 import logging
 import types
 
@@ -127,12 +128,7 @@ def encode_absolute_time(timepoint):
     bits += bitarray('1');
     
     # b1-17: MJD
-    a = (14 - timepoint.month) / 12;
-    y = timepoint.year + 4800 - a;
-    m = timepoint.month + (12 * a) - 3;
-    jdn = timepoint.day + ((153 * m) + 2) / 5 + (365 * y) + (y / 4) - (y / 100) + (y / 400) - 32045;
-    jd = jdn + (timepoint.hour - 12) / 24 + timepoint.minute / 1440 + timepoint.second / 86400;
-    mjd = (int)(jd - 2400000.5);
+    mjd = int((gcal2jd(timepoint.year,timepoint.month,timepoint.day))[1])
     bits += int_to_bitarray(mjd, 17)
     
     # b18-19: RFU
