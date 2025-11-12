@@ -328,6 +328,30 @@ class ContentName(HeaderParameter):
         return "<ContentName: %s>" % str(self)
     
         
+class UniqueBodyVersion(HeaderParameter):
+    '''Unique Body Version'''
+    
+    def __init__(self, unique32):
+        HeaderParameter.__init__(self, 13)
+        self.unique32 = unique32
+        
+    def encode_data(self):
+        bits = bitarray()
+        bits += int_to_bitarray(self.unique32, 32) # (0-31): Unique body version 32-bit
+        return bits
+    
+    @staticmethod
+    def decode_data(data):
+        unique32 = int(data[0:32].to01(), 2)
+        return UniqueBodyVersion(unique32)
+    
+    def __str__(self):
+        return self.unique32
+        
+    def __repr__(self):
+        return "<UniqueBodyVersion: %d>" % str(self)
+    
+        
 class MimeType(HeaderParameter):
     '''Content MIME type'''
     
@@ -552,6 +576,7 @@ class SortedHeaderInformation(DirectoryParameter):
         
 # register the core parameter decoders
 HeaderParameter.decoders[12] = ContentName.decode_data
+HeaderParameter.decoders[13] = UniqueBodyVersion.decode_data
 HeaderParameter.decoders[16] = MimeType.decode_data
 HeaderParameter.decoders[4] = ExpirationParameter.decode_data
 HeaderParameter.decoders[17] = Compression.decode_data
